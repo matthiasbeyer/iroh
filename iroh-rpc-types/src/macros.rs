@@ -1,7 +1,7 @@
 macro_rules! proxy_serve {
     ($label:ident, $($name:ident: $req:ty => $res:ty),+) => {
         paste::paste! {
-            pub async fn serve<T: $label>(addr: [<$label ServerAddr>], source: T) -> anyhow::Result<()> {
+            pub async fn serve<T: $label>(addr: [<$label ServerAddr>], source: T) -> Result<(), $crate::error::Error> {
                 match addr {
                     #[cfg(feature = "grpc")]
                     $crate::Addr::GrpcHttp2(addr) => {
@@ -21,12 +21,11 @@ macro_rules! proxy_serve {
 
                     #[cfg(feature = "grpc")]
                     $crate::Addr::GrpcHttp2Lookup(name) => {
-                        anyhow::bail!("cannot serve on lookup address: {}", name);
+                        return Err($crate::error::Error::CannotLookupAddr(name))
                     }
 
                     #[cfg(all(feature = "grpc", unix))]
                     $crate::Addr::GrpcUds(path) => {
-                        use anyhow::Context;
                         use tokio::net::UnixListener;
                         use tokio_stream::wrappers::UnixListenerStream;
 
@@ -36,10 +35,10 @@ macro_rules! proxy_serve {
                             .await;
 
                         if path.exists() {
-                            if path.is_dir() {
-                                anyhow::bail!("cannot bind socket to directory: {}", path.display());
+                            return if path.is_dir() {
+                                Err($crate::error::Error::SocketToDir(path))
                             } else {
-                                anyhow::bail!("cannot bind socket: already exists: {}", path.display());
+                                Err($crate::error::Error::SocketExists(path))
                             }
                         }
 
@@ -47,7 +46,7 @@ macro_rules! proxy_serve {
                         // Create a more precise error to recognize that case.
                         if let Some(parent) = path.parent() {
                             if !parent.exists() {
-                                anyhow::bail!("socket parent directory doesn't exist: {}", parent.display());
+                                return Err($crate::error::Error::SocketParentDirDoesNotExist(parent.to_path_buf()))
                             }
                         }
 
@@ -60,7 +59,7 @@ macro_rules! proxy_serve {
                         }
 
                         let uds = UnixListener::bind(&path)
-                            .with_context(|| format!("failed to bind to {}", path.display()))?;
+                            .map_err(|e| $crate::error::Error::FailedToBind(path.to_path_buf(), e))?;
                         let _guard = UdsGuard(path.clone().into());
 
                         let uds_stream = UnixListenerStream::new(uds);
@@ -149,14 +148,14 @@ macro_rules! proxy_traits {
             #[async_trait::async_trait]
             pub trait $label: Send + Sync + 'static {
                 $(
-                    async fn $name(&self, request: $req) -> anyhow::Result<$res>;
+                    async fn $name(&self, request: $req) -> Result<$res, $crate::error::Error>;
                 )+
             }
 
             #[async_trait::async_trait]
             impl $label for [<$label ClientBackend>] {
                 $(
-                    async fn $name(&self, req: $req) -> anyhow::Result<$res> {
+                    async fn $name(&self, req: $req) -> Result<$res, $crate::error::Error> {
                         match self {
                             #[cfg(feature = "grpc")]
                             Self::Grpc { client, .. } => {
@@ -168,7 +167,7 @@ macro_rules! proxy_traits {
                                     let res = {
                                         use futures::StreamExt;
                                         Box::pin(res.map(|p| {
-                                            p.map_err(|e| anyhow::anyhow!(e))
+                                            p.map_err(|e| $crate::error::Error::Str(e.to_string()))
                                         }))
                                     };
                                     // hack
@@ -182,14 +181,14 @@ macro_rules! proxy_traits {
                             #[cfg(feature = "mem")]
                             Self::Mem(s) => {
                                 let (s_res, r_res) = tokio::sync::oneshot::channel();
-                                s.send(([<$label Request>]::$name(req), s_res)).await.map_err(|_| anyhow::anyhow!("send failed"))?;
+                                s.send(([<$label Request>]::$name(req), s_res)).await.map_err(|_| $crate::error::Error::SendFailed)?;
 
                                 let res = r_res.await?;
                                 #[allow(irrefutable_let_patterns)]
                                 if let [<$label Response>]::$name(res) = res {
-                                    return res.map_err(|e| anyhow::anyhow!(e))
+                                    return res.map_err(|e| $crate::error::Error::Str(e))
                                 } else {
-                                    anyhow::bail!("invalid response");
+                                    Err($crate::error::Error::InvalidResponse)
                                 }
                             }
                         }

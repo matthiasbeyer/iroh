@@ -4,9 +4,10 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{anyhow, bail};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+use crate::error::Error;
 
 #[derive(SerializeDisplay, DeserializeFromStr, Clone)]
 pub enum Addr<T = ()> {
@@ -76,12 +77,12 @@ impl<T> Debug for Addr<T> {
 }
 
 impl<T> FromStr for Addr<T> {
-    type Err = anyhow::Error;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         #[cfg(feature = "mem")]
         if s == "mem" {
-            bail!("memory addresses can not be serialized or deserialized");
+            return Err(Error::MemAddrSerde);
         }
 
         #[cfg(feature = "grpc")]
@@ -109,7 +110,7 @@ impl<T> FromStr for Addr<T> {
             }
         }
 
-        Err(anyhow!("invalid addr: {}", s))
+        Err(Error::InvalidAddr(s.to_string()))
     }
 }
 
