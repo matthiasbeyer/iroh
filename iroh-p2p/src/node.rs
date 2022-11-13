@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use ahash::AHashMap;
-use anyhow::{anyhow, bail, Context, Result};
 use cid::Cid;
 use futures_util::stream::StreamExt;
 use iroh_metrics::{core::MRecorder, inc, libp2p_metrics, p2p::P2PMetrics};
@@ -32,6 +31,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use iroh_bitswap::{BitswapEvent, Block};
 
+use crate::error::Error;
 use crate::keys::{Keychain, Storage};
 use crate::providers::Providers;
 use crate::rpc::ProviderRequestKey;
@@ -70,8 +70,8 @@ pub enum GossipsubEvent {
 pub struct Node<KeyStorage: Storage> {
     swarm: Swarm<NodeBehaviour>,
     net_receiver_in: Receiver<RpcMessage>,
-    dial_queries: AHashMap<PeerId, Vec<OneShotSender<Result<()>>>>,
-    lookup_queries: AHashMap<PeerId, Vec<oneshot::Sender<Result<IdentifyInfo>>>>,
+    dial_queries: AHashMap<PeerId, Vec<OneShotSender<Result<(), Error>>>>,
+    lookup_queries: AHashMap<PeerId, Vec<oneshot::Sender<Result<IdentifyInfo, Error>>>>,
     // TODO(ramfox): use new providers queue instead
     find_on_dht_queries: AHashMap<Vec<u8>, DHTQuery>,
     network_events: Vec<Sender<NetworkEvent>>,
@@ -87,7 +87,7 @@ pub struct Node<KeyStorage: Storage> {
 }
 
 // TODO(ramfox): use new providers queue instead
-type DHTQuery = (PeerId, Vec<oneshot::Sender<Result<()>>>);
+type DHTQuery = (PeerId, Vec<oneshot::Sender<Result<(), Error>>>);
 
 type BitswapSessions = AHashMap<u64, Vec<(oneshot::Sender<()>, JoinHandle<()>)>>;
 
@@ -107,7 +107,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
         config: Config,
         rpc_addr: P2pServerAddr,
         mut keychain: Keychain<KeyStorage>,
-    ) -> Result<Self> {
+    ) -> Result<Self, Error> {
         let (network_sender_in, network_receiver_in) = channel(1024); // TODO: configurable
 
         let Config {
@@ -121,9 +121,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
             rpc::new(rpc_addr, network_sender_in).await.unwrap()
         });
 
-        let rpc_client = RpcClient::new(rpc_client)
-            .await
-            .context("failed to create rpc client")?;
+        let rpc_client = RpcClient::new(rpc_client).await?;
 
         let keypair = load_identity(&mut keychain).await?;
         let mut swarm = build_swarm(&libp2p_config, &keypair, rpc_client.clone()).await?;
@@ -150,7 +148,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
     }
 
     /// Starts the libp2p service networking stack. This Future resolves when shutdown occurs.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> Result<(), Error> {
         info!("Local Peer ID: {}", self.swarm.local_peer_id());
 
         let mut nice_interval = if self.use_dht {
@@ -221,7 +219,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
         }
     }
 
-    fn expiry(&mut self) -> Result<()> {
+    fn expiry(&mut self) -> Result<(), Error> {
         // Cleanup bitswap sessions
         let mut to_remove = Vec::new();
         for (session_id, workers) in &mut self.bitswap_sessions {
@@ -298,7 +296,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
         r
     }
 
-    fn destroy_session(&mut self, ctx: u64, response_channel: oneshot::Sender<Result<()>>) {
+    fn destroy_session(&mut self, ctx: u64, response_channel: oneshot::Sender<Result<(), Error>>) {
         if let Some(bs) = self.swarm.behaviour().bitswap.as_ref() {
             let workers = self.bitswap_sessions.remove(&ctx);
             let client = bs.client().clone();
@@ -323,7 +321,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                 debug!("session {} stopped", ctx);
             });
         } else {
-            let _ = response_channel.send(Err(anyhow!("no bitswap available")));
+            let _ = response_channel.send(Err(Error::NoBitswapAvailable));
         }
     }
 
@@ -334,7 +332,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
         cid: Cid,
         providers: HashSet<PeerId>,
         mut chan: OneShotSender<Result<Block, String>>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         if let Some(bs) = self.swarm.behaviour().bitswap.as_ref() {
             let client = bs.client().clone();
             let (closer_s, closer_r) = oneshot::channel();
@@ -368,7 +366,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
 
             Ok(())
         } else {
-            bail!("no bitswap available");
+            Err(Error::NoBitswapAvailable)
         }
     }
 
@@ -378,7 +376,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
         event: SwarmEvent<
             <NodeBehaviour as NetworkBehaviour>::OutEvent,
             <<<NodeBehaviour as NetworkBehaviour>::ConnectionHandler as IntoConnectionHandler>::Handler as ConnectionHandler>::Error>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         libp2p_metrics().record(&event);
         match event {
             // outbound events
@@ -419,7 +417,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                     if let Some(channels) = self.dial_queries.get_mut(&peer_id) {
                         while let Some(channel) = channels.pop() {
                             channel
-                                .send(Err(anyhow!("Error dialing peer {:?}: {}", peer_id, error)))
+                                .send(Err(Error::ErrorDialingPeer(peer_id, error.to_string())))
                                 .ok();
                         }
                     }
@@ -444,7 +442,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
     }
 
     #[tracing::instrument(skip(self))]
-    fn handle_node_event(&mut self, event: Event) -> Result<()> {
+    fn handle_node_event(&mut self, event: Event) -> Result<(), Error> {
         match event {
             Event::Bitswap(e) => {
                 match e {
@@ -547,7 +545,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                                     if have_peer {
                                         Ok(())
                                     } else {
-                                        Err(anyhow!("Failed to find peer {:?} on the DHT", peer_id))
+                                        Err(Error::FailedToFindPeer(peer_id))
                                     }
                                 };
                                 tokio::task::spawn(async move {
@@ -566,11 +564,8 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                             {
                                 tokio::task::spawn(async move {
                                     for chan in channels.into_iter() {
-                                        chan.send(Err(anyhow!(
-                                            "Failed to find peer {:?} on the DHT: Timeout",
-                                            peer_id
-                                        )))
-                                        .ok();
+                                        chan.send(Err(Error::FailedToFindPeerTimeout(peer_id)))
+                                            .ok();
                                     }
                                 });
                             }
@@ -621,10 +616,9 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                 } else if let IdentifyEvent::Error { peer_id, error } = *e {
                     if let Some(channels) = self.lookup_queries.remove(&peer_id) {
                         for chan in channels {
-                            chan.send(Err(anyhow!(
-                                "error upgrading connection to peer {:?}: {}",
+                            chan.send(Err(Error::UpgradingConnectionToPeer(
                                 peer_id,
-                                error
+                                error.to_string(),
                             )))
                             .ok();
                         }
@@ -699,7 +693,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
     }
 
     #[tracing::instrument(skip(self))]
-    fn handle_rpc_message(&mut self, message: RpcMessage) -> Result<bool> {
+    fn handle_rpc_message(&mut self, message: RpcMessage) -> Result<bool, Error> {
         // Inbound messages
         match message {
             RpcMessage::ExternalAddrs(response_channel) => {
@@ -728,8 +722,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
             } => {
                 trace!("context:{} bitswap_request", ctx);
                 for (cid, response_channel) in cids.into_iter().zip(response_channels.into_iter()) {
-                    self.want_block(ctx, cid, providers.clone(), response_channel)
-                        .map_err(|err| anyhow!("Failed to send a bitswap want_block: {:?}", err))?;
+                    self.want_block(ctx, cid, providers.clone(), response_channel)?;
                 }
             }
             RpcMessage::BitswapNotifyNewBlocks {
@@ -774,13 +767,11 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
             },
             RpcMessage::StartProviding(response_channel, key) => {
                 if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
-                    let res: Result<QueryId> = kad.start_providing(key).map_err(|e| e.into());
+                    let res: Result<QueryId, _> = kad.start_providing(key).map_err(|e| e.into());
                     // TODO: wait for kad to process the query request before returning
                     response_channel.send(res).ok();
                 } else {
-                    response_channel
-                        .send(Err(anyhow!("kademlia is not available")))
-                        .ok();
+                    response_channel.send(Err(Error::KademilaNotAvailable)).ok();
                 }
             }
             RpcMessage::StopProviding(response_channel, key) => {
@@ -788,9 +779,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                     kad.stop_providing(&key);
                     response_channel.send(Ok(())).ok();
                 } else {
-                    response_channel
-                        .send(Err(anyhow!("kademlia is not availalbe")))
-                        .ok();
+                    response_channel.send(Err(Error::KademilaNotAvailable)).ok();
                 }
             }
             RpcMessage::NetListeningAddrs(response_channel) => {
@@ -800,7 +789,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
 
                 response_channel
                     .send((peer_id, listeners))
-                    .map_err(|_| anyhow!("Failed to get Libp2p listeners"))?;
+                    .map_err(|_| Error::FailedToGetLibp2pListeners)?;
             }
             RpcMessage::NetPeers(response_channel) => {
                 #[allow(clippy::needless_collect)]
@@ -812,7 +801,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
 
                 response_channel
                     .send(peer_addresses)
-                    .map_err(|_| anyhow!("Failed to get Libp2p peers"))?;
+                    .map_err(|_| Error::FailedToGetLibp2pPeers)?;
             }
             RpcMessage::NetConnect(response_channel, peer_id, addrs) => {
                 if self.swarm.is_connected(&peer_id) {
@@ -840,7 +829,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                         warn!("invalid dial options: {:?}", e);
                         while let Some(channel) = channels.pop() {
                             channel
-                                .send(Err(anyhow!("error dialing peer {:?}: {}", peer_id, e)))
+                                .send(Err(Error::ErrorDialingPeer(peer_id, e.to_string())))
                                 .ok();
                         }
                     }
@@ -859,7 +848,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                     if let Err(e) = Swarm::dial(&mut self.swarm, dial_opts) {
                         while let Some(channel) = channels.pop() {
                             channel
-                                .send(Err(anyhow!("error dialing peer {:?}: {}", peer_id, e)))
+                                .send(Err(Error::ErrorDialingPeer(peer_id, e.to_string())))
                                 .ok();
                         }
                     }
@@ -874,7 +863,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
 
                 response_channel
                     .send(())
-                    .map_err(|_| anyhow!("sender dropped"))?;
+                    .map_err(|_| Error::SenderDropped)?;
             }
             RpcMessage::Gossipsub(g) => {
                 let gossipsub = match self.swarm.behaviour_mut().gossipsub.as_mut() {
@@ -889,13 +878,13 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                         gossipsub.add_explicit_peer(&peer_id);
                         response_channel
                             .send(())
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::AllMeshPeers(response_channel) => {
                         let peers = gossipsub.all_mesh_peers().copied().collect();
                         response_channel
                             .send(peers)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::AllPeers(response_channel) => {
                         let all_peers = gossipsub
@@ -904,44 +893,44 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                             .collect();
                         response_channel
                             .send(all_peers)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::MeshPeers(response_channel, topic_hash) => {
                         let peers = gossipsub.mesh_peers(&topic_hash).copied().collect();
                         response_channel
                             .send(peers)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::Publish(response_channel, topic_hash, bytes) => {
                         let res = gossipsub
                             .publish(IdentTopic::new(topic_hash.into_string()), bytes.to_vec());
                         response_channel
                             .send(res)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::RemoveExplicitPeer(response_channel, peer_id) => {
                         gossipsub.remove_explicit_peer(&peer_id);
                         response_channel
                             .send(())
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::Subscribe(response_channel, topic_hash) => {
                         let res = gossipsub.subscribe(&IdentTopic::new(topic_hash.into_string()));
                         response_channel
                             .send(res)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::Topics(response_channel) => {
                         let topics = gossipsub.topics().cloned().collect();
                         response_channel
                             .send(topics)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                     rpc::GossipsubMessage::Unsubscribe(response_channel, topic_hash) => {
                         let res = gossipsub.unsubscribe(&IdentTopic::new(topic_hash.into_string()));
                         response_channel
                             .send(res)
-                            .map_err(|_| anyhow!("sender dropped"))?;
+                            .map_err(|_| Error::SenderDropped)?;
                     }
                 }
             }
@@ -976,9 +965,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
                     }
                 } else {
                     tokio::task::spawn(async move {
-                        response_channel
-                            .send(Err(anyhow!("kademlia is not available")))
-                            .ok();
+                        response_channel.send(Err(Error::KademilaNotAvailable)).ok();
                     });
                 }
             }
@@ -991,7 +978,7 @@ impl<KeyStorage: Storage> Node<KeyStorage> {
     }
 }
 
-async fn load_identity<S: Storage>(kc: &mut Keychain<S>) -> Result<Keypair> {
+async fn load_identity<S: Storage>(kc: &mut Keychain<S>) -> Result<Keypair, Error> {
     if kc.is_empty().await? {
         info!("no identity found, creating",);
         kc.create_ed25519_key().await?;
@@ -1000,12 +987,12 @@ async fn load_identity<S: Storage>(kc: &mut Keychain<S>) -> Result<Keypair> {
     // for now we just use the first key
     let first_key = kc.keys().next().await;
     if let Some(keypair) = first_key {
-        let keypair: Keypair = keypair?.into();
+        let keypair: Keypair = keypair.map_err(Error::from)?.into();
         info!("identity loaded: {}", PeerId::from(keypair.public()));
         return Ok(keypair);
     }
 
-    Err(anyhow!("inconsistent keystate"))
+    Err(Error::InconsistentKeyState)
 }
 
 #[cfg(test)]
@@ -1021,7 +1008,6 @@ mod tests {
     use libp2p::{identity::Keypair as Libp2pKeypair, kad::record::Key};
 
     use super::*;
-    use anyhow::Result;
     use iroh_rpc_client::P2pClient;
     use iroh_rpc_types::{
         p2p::{P2pClientAddr, P2pServerAddr},
@@ -1031,7 +1017,7 @@ mod tests {
 
     #[cfg(feature = "rpc-grpc")]
     #[tokio::test]
-    async fn test_fetch_providers_grpc_dht() -> Result<()> {
+    async fn test_fetch_providers_grpc_dht() -> Result<(), Error> {
         let server_addr = "grpc://0.0.0.0:4401".parse().unwrap();
         let client_addr = "grpc://0.0.0.0:4401".parse().unwrap();
         fetch_providers(
@@ -1045,7 +1031,7 @@ mod tests {
 
     #[cfg(all(feature = "rpc-grpc", unix))]
     #[tokio::test]
-    async fn test_fetch_providers_uds_dht() -> Result<()> {
+    async fn test_fetch_providers_uds_dht() -> Result<(), Error> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("cool.iroh");
 
@@ -1062,7 +1048,7 @@ mod tests {
 
     #[cfg(feature = "rpc-mem")]
     #[tokio::test]
-    async fn test_fetch_providers_mem_dht() -> Result<()> {
+    async fn test_fetch_providers_mem_dht() -> Result<(), Error> {
         tracing_subscriber::registry()
             .with(fmt::layer().pretty())
             .with(EnvFilter::from_default_env())
@@ -1249,7 +1235,7 @@ mod tests {
         addr: Multiaddr,
         rpc_server_addr: P2pServerAddr,
         rpc_client_addr: P2pClientAddr,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let test_runner = TestRunnerBuilder::new()
             .with_addr(addr)
             .with_rpc_addrs(rpc_server_addr, rpc_client_addr)
