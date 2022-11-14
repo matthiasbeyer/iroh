@@ -1,6 +1,5 @@
 use std::{collections::HashSet, str::FromStr, sync::Arc};
 
-use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cid::{multibase::Base, Cid};
@@ -11,6 +10,7 @@ use reqwest::Url;
 use tracing::{info, trace, warn};
 
 use crate::{
+    error::Error,
     indexer::Indexer,
     parse_links,
     resolver::{ContextId, LoadedCid, LoaderContext, Source, IROH_STORE},
@@ -19,24 +19,24 @@ use crate::{
 #[async_trait]
 pub trait ContentLoader: Sync + Send + std::fmt::Debug + Clone + 'static {
     /// Loads the actual content of a given cid.
-    async fn load_cid(&self, cid: &Cid, ctx: &LoaderContext) -> Result<LoadedCid>;
+    async fn load_cid(&self, cid: &Cid, ctx: &LoaderContext) -> Result<LoadedCid, Error>;
     /// Signal that the passend in session is not used anymore.
-    async fn stop_session(&self, ctx: ContextId) -> Result<()>;
+    async fn stop_session(&self, ctx: ContextId) -> Result<(), Error>;
     /// Checks if the given cid is present in the local storage.
-    async fn has_cid(&self, cid: &Cid) -> Result<bool>;
+    async fn has_cid(&self, cid: &Cid) -> Result<bool, Error>;
 }
 
 #[async_trait]
 impl<T: ContentLoader> ContentLoader for Arc<T> {
-    async fn load_cid(&self, cid: &Cid, ctx: &LoaderContext) -> Result<LoadedCid> {
+    async fn load_cid(&self, cid: &Cid, ctx: &LoaderContext) -> Result<LoadedCid, Error> {
         self.as_ref().load_cid(cid, ctx).await
     }
 
-    async fn stop_session(&self, ctx: ContextId) -> Result<()> {
+    async fn stop_session(&self, ctx: ContextId) -> Result<(), Error> {
         self.as_ref().stop_session(ctx).await
     }
 
-    async fn has_cid(&self, cid: &Cid) -> Result<bool> {
+    async fn has_cid(&self, cid: &Cid) -> Result<bool, Error> {
         self.as_ref().has_cid(cid).await
     }
 }
@@ -64,8 +64,9 @@ pub enum GatewayUrl {
 }
 
 impl FromStr for GatewayUrl {
-    type Err = anyhow::Error;
-    fn from_str(input: &str) -> Result<Self> {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
         if input.starts_with("http") || input.starts_with("https") {
             let url = input.parse()?;
             return Ok(GatewayUrl::Full(url));
@@ -83,7 +84,7 @@ impl GatewayUrl {
         }
     }
 
-    pub fn as_url(&self, cid: &Cid) -> Result<Url> {
+    pub fn as_url(&self, cid: &Cid) -> Result<Url, Error> {
         let cid_str = cid.into_v1()?.to_string_of_base(Base::Base32Lower)?;
         let url = match self {
             GatewayUrl::Full(raw) => {
@@ -100,7 +101,7 @@ impl GatewayUrl {
 }
 
 impl FullLoader {
-    pub fn new(client: Client, config: FullLoaderConfig) -> Result<Self> {
+    pub fn new(client: Client, config: FullLoaderConfig) -> Result<Self, Error> {
         let indexer = config.indexer.map(Indexer::new).transpose()?;
 
         Ok(Self {
@@ -120,7 +121,7 @@ impl FullLoader {
         Some(gw)
     }
 
-    async fn fetch_store(&self, cid: &Cid) -> Result<Option<LoadedCid>> {
+    async fn fetch_store(&self, cid: &Cid) -> Result<Option<LoadedCid>, Error> {
         match self.client.try_store() {
             Ok(store) => Ok(store.get(*cid).await?.map(|data| LoadedCid {
                 data,
@@ -133,7 +134,7 @@ impl FullLoader {
         }
     }
 
-    async fn fetch_bitswap(&self, ctx: ContextId, cid: &Cid) -> Result<Option<LoadedCid>> {
+    async fn fetch_bitswap(&self, ctx: ContextId, cid: &Cid) -> Result<Option<LoadedCid>, Error> {
         match self.client.try_p2p() {
             Ok(p2p) => {
                 let providers: HashSet<_> = if let Some(ref indexer) = self.indexer {
@@ -159,13 +160,13 @@ impl FullLoader {
         }
     }
 
-    async fn fetch_gateway(&self, cid: &Cid) -> Result<Option<LoadedCid>> {
+    async fn fetch_gateway(&self, cid: &Cid) -> Result<Option<LoadedCid>, Error> {
         match self.next_gateway().await {
             Some(url) => {
                 let response = reqwest::get(url.as_url(cid)?).await?;
                 // Filter out non http 200 responses.
                 if !response.status().is_success() {
-                    return Err(anyhow!("unexpected http status"));
+                    return Err(Error::UnexpectedHttpStatus)
                 }
                 let data = response.bytes().await?;
                 // Make sure the content is not tampered with.
@@ -175,7 +176,7 @@ impl FullLoader {
                         source: Source::Http(url.as_string()),
                     }))
                 } else {
-                    Err(anyhow!("invalid CID hash"))
+                    Err(Error::InvalidHash)
                 }
             }
             None => Ok(None),
@@ -216,7 +217,7 @@ impl FullLoader {
 
 #[async_trait]
 impl ContentLoader for FullLoader {
-    async fn stop_session(&self, ctx: ContextId) -> Result<()> {
+    async fn stop_session(&self, ctx: ContextId) -> Result<(), Error> {
         self.client
             .try_p2p()?
             .stop_session_bitswap(ctx.into())
@@ -224,7 +225,7 @@ impl ContentLoader for FullLoader {
         Ok(())
     }
 
-    async fn load_cid(&self, cid: &Cid, ctx: &LoaderContext) -> Result<LoadedCid> {
+    async fn load_cid(&self, cid: &Cid, ctx: &LoaderContext) -> Result<LoadedCid, Error> {
         trace!("{:?} loading {}", ctx.id(), cid);
 
         if let Some(loaded) = self.fetch_store(cid).await? {
@@ -245,7 +246,7 @@ impl ContentLoader for FullLoader {
                 } else {
                     gateway_fut
                         .await?
-                        .ok_or_else(|| anyhow!("failed to find {}", cid))?
+                        .ok_or_else(|| Error::FailedToFind(*cid))?
                 }
             }
             Either::Right((gateway, bitswap_future)) => {
@@ -254,7 +255,7 @@ impl ContentLoader for FullLoader {
                 } else {
                     bitswap_future
                         .await?
-                        .ok_or_else(|| anyhow!("failed to find {}", cid))?
+                        .ok_or_else(|| Error::FailedToFind(*cid))?
                 }
             }
         };
@@ -263,7 +264,11 @@ impl ContentLoader for FullLoader {
         Ok(loaded)
     }
 
-    async fn has_cid(&self, cid: &Cid) -> Result<bool> {
-        self.client.try_store()?.has(*cid).await
+    async fn has_cid(&self, cid: &Cid) -> Result<bool, Error> {
+        self.client
+            .try_store()?
+            .has(*cid)
+            .await
+            .map_err(Error::from)
     }
 }
