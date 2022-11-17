@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use crate::{
     bad_bits::BadBits,
     client::Client,
+    error::Error,
     handlers::{get_app_routes, StateConfig},
     rpc,
     rpc::Gateway,
@@ -33,7 +34,7 @@ impl<T: ContentLoader + std::marker::Unpin> Core<T> {
         rpc_addr: GatewayServerAddr,
         bad_bits: Arc<Option<RwLock<BadBits>>>,
         content_loader: T,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, Error> {
         tokio::spawn(async move {
             if let Err(err) = rpc::new(rpc_addr, Gateway::default()).await {
                 tracing::error!("Failed to run gateway rpc handler: {}", err);
@@ -63,7 +64,7 @@ impl<T: ContentLoader + std::marker::Unpin> Core<T> {
     pub async fn new_with_state(
         rpc_addr: GatewayServerAddr,
         state: Arc<State<T>>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, Error> {
         tokio::spawn(async move {
             if let Err(err) = rpc::new(rpc_addr, Gateway::default()).await {
                 tracing::error!("Failed to run gateway rpc handler: {}", err);
@@ -76,7 +77,7 @@ impl<T: ContentLoader + std::marker::Unpin> Core<T> {
         config: Arc<dyn StateConfig>,
         bad_bits: Arc<Option<RwLock<BadBits>>>,
         content_loader: T,
-    ) -> anyhow::Result<Arc<State<T>>> {
+    ) -> Result<Arc<State<T>>, Error> {
         let mut templates = HashMap::new();
         templates.insert(
             "dir_list".to_string(),

@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .flatten()
                 .map(|u| u.parse())
-                .collect::<Result<_>>()
+                .collect::<Result<_, _>>()
                 .context("invalid gateway url")?,
             indexer: config
                 .indexer_endpoint

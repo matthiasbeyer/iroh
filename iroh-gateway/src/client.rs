@@ -2,7 +2,6 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::task::Poll;
 
-use anyhow::Result;
 use bytes::Bytes;
 use cid::Cid;
 use futures::{StreamExt, TryStream};
@@ -25,6 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
+use crate::error::Error;
 use crate::response::ResponseFormat;
 use crate::{constants::RECURSION_LIMIT, handlers::GetParams};
 
@@ -220,9 +220,9 @@ impl<T: ContentLoader + std::marker::Unpin> Client<T> {
 
 impl<T: ContentLoader> Client<T> {
     #[tracing::instrument(skip(self))]
-    pub async fn has_file_locally(&self, cid: &Cid) -> Result<bool> {
+    pub async fn has_file_locally(&self, cid: &Cid) -> Result<bool, Error> {
         info!("has cid {}", cid);
-        self.resolver.has_cid(cid).await
+        self.resolver.has_cid(cid).await.map_err(Error::from)
     }
 }
 
@@ -241,7 +241,7 @@ async fn fetch_car_recursive<T, W>(
     path: iroh_resolver::resolver::Path,
     writer: W,
     start_time: std::time::Instant,
-) -> Result<(), anyhow::Error>
+) -> Result<(), Error>
 where
     T: ContentLoader,
     W: AsyncWrite + Send + Unpin,
@@ -252,7 +252,7 @@ where
     let root = stream
         .next()
         .await
-        .ok_or_else(|| anyhow::anyhow!("root cid not found"))??;
+        .ok_or_else(|| Error::RootCidNotFound)??;
 
     let header = CarHeader::new_v1(vec![*root.cid()]);
     let mut writer = CarWriter::new(header, writer);

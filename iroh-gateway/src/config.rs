@@ -1,5 +1,4 @@
 use crate::constants::*;
-use anyhow::{bail, Result};
 use axum::http::{header::*, Method};
 use config::{ConfigError, Map, Source, Value};
 use headers::{
@@ -10,6 +9,8 @@ use iroh_rpc_client::Config as RpcClientConfig;
 use iroh_rpc_types::{gateway::GatewayServerAddr, Addr};
 use iroh_util::insert_into_config_map;
 use serde::{Deserialize, Serialize};
+
+use crate::error::Error;
 
 /// CONFIG_FILE_NAME is the name of the optional config file located in the iroh home directory
 pub const CONFIG_FILE_NAME: &str = "gateway.config.toml";
@@ -65,7 +66,7 @@ impl Config {
     }
 
     /// Derive server addr for non memory addrs.
-    pub fn server_rpc_addr(&self) -> Result<Option<GatewayServerAddr>> {
+    pub fn server_rpc_addr(&self) -> Result<Option<GatewayServerAddr>, Error> {
         self.rpc_client
             .gateway_addr
             .as_ref()
@@ -77,8 +78,8 @@ impl Config {
                     #[cfg(all(feature = "rpc-grpc", unix))]
                     Addr::GrpcUds(path) => Ok(Addr::GrpcUds(path.clone())),
                     #[cfg(feature = "rpc-mem")]
-                    Addr::Mem(_) => bail!("can not derive rpc_addr for mem addr"),
-                    _ => bail!("invalid rpc_addr"),
+                    Addr::Mem(_) => Err(Error::CanNotDeriveRpcAddrForMemAddr),
+                    _ => Err(Error::InvalidRpcAddr),
                 }
             })
             .transpose()

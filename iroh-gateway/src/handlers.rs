@@ -28,7 +28,6 @@ use serde_json::{
 use serde_qs;
 use std::{
     collections::HashMap,
-    error::Error,
     fmt::Write,
     ops::Range,
     sync::Arc,
@@ -45,7 +44,7 @@ use crate::{
     client::{FileResult, Request},
     constants::*,
     core::State,
-    error::GatewayError,
+    error::Error,
     headers::*,
     response::{get_response_format, GatewayResponse, ResponseFormat},
     templates::{icon_class_name, ICONS_STYLESHEET, STYLESHEET},
@@ -130,7 +129,7 @@ pub async fn get_handler<T: ContentLoader + std::marker::Unpin>(
     method: http::Method,
     http_req: HttpRequest<Body>,
     request_headers: HeaderMap,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     inc!(GatewayMetrics::Requests);
     let start_time = time::Instant::now();
     // parse path params
@@ -161,7 +160,7 @@ pub async fn get_handler<T: ContentLoader + std::marker::Unpin>(
     let full_content_path = format!("/{}/{}{}", scheme, cid, cpath);
     let resolved_path: iroh_resolver::resolver::Path = full_content_path
         .parse()
-        .map_err(|e: anyhow::Error| e.to_string())
+        .map_err(|e: iroh_resolver::error::Error| e.to_string())
         .map_err(|e| error(StatusCode::BAD_REQUEST, &e, &state))?;
     // TODO: handle 404 or error
     let resolved_cid = resolved_path.root();
@@ -255,7 +254,7 @@ pub async fn stylesheet_icons() -> (HeaderMap, &'static str) {
 fn protocol_handler_redirect<T: ContentLoader>(
     uri_param: String,
     state: &State<T>,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     let u = match Url::parse(&uri_param) {
         Ok(u) => u,
         Err(e) => {
@@ -291,7 +290,7 @@ fn service_worker_check<T: ContentLoader>(
     request_headers: &HeaderMap,
     cpath: String,
     state: &State<T>,
-) -> Result<(), GatewayError> {
+) -> Result<(), Error> {
     if request_headers.contains_key(&HEADER_SERVICE_WORKER) {
         let sw = request_headers.get(&HEADER_SERVICE_WORKER).unwrap();
         if sw.to_str().unwrap() == "script" && cpath.is_empty() {
@@ -309,7 +308,7 @@ fn service_worker_check<T: ContentLoader>(
 fn unsuported_header_check<T: ContentLoader>(
     request_headers: &HeaderMap,
     state: &State<T>,
-) -> Result<(), GatewayError> {
+) -> Result<(), Error> {
     if request_headers.contains_key(&HEADER_X_IPFS_GATEWAY_PREFIX) {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -325,7 +324,7 @@ async fn handle_only_if_cached<T: ContentLoader>(
     request_headers: &HeaderMap,
     state: &State<T>,
     cid: &CidOrDomain,
-) -> Result<bool, GatewayError> {
+) -> Result<bool, Error> {
     if request_headers.contains_key(&HEADER_CACHE_CONTROL) {
         let hv = request_headers.get(&HEADER_CACHE_CONTROL).unwrap();
         if hv.to_str().unwrap() == "only-if-cached" {
@@ -407,7 +406,7 @@ async fn serve_raw<T: ContentLoader + std::marker::Unpin>(
     mut headers: HeaderMap,
     http_req: &HttpRequest<Body>,
     start_time: std::time::Instant,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     let range: Option<Range<u64>> = if http_req.headers().contains_key(RANGE) {
         parse_range_header(http_req.headers().get(RANGE).unwrap())
     } else {
@@ -461,7 +460,7 @@ async fn serve_car<T: ContentLoader + std::marker::Unpin>(
     state: Arc<State<T>>,
     mut headers: HeaderMap,
     start_time: std::time::Instant,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     // TODO: handle car versions
     // FIXME: we currently only retrieve full cids
     let (body, metadata) = state
@@ -503,7 +502,7 @@ async fn serve_car_recursive<T: ContentLoader + std::marker::Unpin>(
     state: Arc<State<T>>,
     mut headers: HeaderMap,
     start_time: std::time::Instant,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     let body = state
         .client
         .clone()
@@ -536,7 +535,7 @@ async fn serve_fs<T: ContentLoader + std::marker::Unpin>(
     mut headers: HeaderMap,
     http_req: &HttpRequest<Body>,
     start_time: std::time::Instant,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     let range: Option<Range<u64>> = if http_req.headers().contains_key(RANGE) {
         parse_range_header(http_req.headers().get(RANGE).unwrap())
     } else {
@@ -553,7 +552,7 @@ async fn serve_fs<T: ContentLoader + std::marker::Unpin>(
     add_ipfs_roots_headers(&mut headers, metadata.clone());
     match body {
         FileResult::Directory(res) => {
-            let dir_list: anyhow::Result<Vec<_>> = res
+            let dir_list: Result<Vec<_>, _> = res
                 .unixfs_read_dir(&state.client.resolver, OutMetrics { start: start_time })
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), &state))?
                 .expect("already known this is a directory")
@@ -648,7 +647,7 @@ async fn serve_fs_dir<T: ContentLoader + std::marker::Unpin>(
     mut headers: HeaderMap,
     http_req: &HttpRequest<Body>,
     start_time: std::time::Instant,
-) -> Result<GatewayResponse, GatewayError> {
+) -> Result<GatewayResponse, Error> {
     let force_dir = req.query_params.force_dir.unwrap_or(false);
     let has_index = dir_list.iter().any(|l| {
         l.name
@@ -748,10 +747,10 @@ fn response<B>(
     status_code: StatusCode,
     body: B,
     headers: HeaderMap,
-) -> Result<GatewayResponse, GatewayError>
+) -> Result<GatewayResponse, Error>
 where
     B: 'static + HttpBody<Data = Bytes> + Send,
-    <B as HttpBody>::Error: Into<Box<dyn Error + Send + Sync + 'static>>,
+    <B as HttpBody>::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
     Ok(GatewayResponse {
         status_code,
@@ -766,9 +765,9 @@ fn error<T: ContentLoader>(
     status_code: StatusCode,
     message: &str,
     state: &State<T>,
-) -> GatewayError {
+) -> Error {
     inc!(GatewayMetrics::ErrorCount);
-    GatewayError {
+    Error::GatewayError {
         status_code,
         message: message.to_string(),
         trace_id: get_current_trace_id(),
@@ -797,8 +796,8 @@ pub async fn middleware_error_handler<T: ContentLoader>(
     err: BoxError,
 ) -> impl IntoResponse {
     inc!(GatewayMetrics::FailCount);
-    if err.is::<GatewayError>() {
-        let err = err.downcast::<GatewayError>().unwrap();
+    if err.is::<Error>() {
+        let err = err.downcast::<Error>().unwrap();
         return err.with_method(method);
     }
 
