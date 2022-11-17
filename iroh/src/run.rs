@@ -1,10 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use console::style;
-use crossterm::style::Stylize;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use iroh_api::{AddEvent, Api, IpfsPath, ServiceStatus};
@@ -13,6 +11,7 @@ use iroh_util::{human, iroh_config_path, make_config};
 
 use crate::config::{Config, CONFIG_FILE_NAME, ENV_PREFIX};
 use crate::doc;
+use crate::error::Error;
 #[cfg(feature = "testing")]
 use crate::fixture::get_fixture_api;
 use crate::p2p::{run_command as run_p2p_command, P2p};
@@ -83,7 +82,7 @@ enum Commands {
 }
 
 impl Cli {
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self) -> Result<(), Error> {
         let config_path = iroh_config_path(CONFIG_FILE_NAME)?;
         let sources = [Some(config_path.as_path()), self.cfg.as_deref()];
         let config = make_config(
@@ -122,7 +121,7 @@ impl Cli {
         map
     }
 
-    async fn cli_command(&self, config: &Config, api: &Api) -> Result<()> {
+    async fn cli_command(&self, config: &Config, api: &Api) -> Result<(), Error> {
         match &self.command {
             Commands::Add {
                 path,
@@ -168,18 +167,15 @@ impl Cli {
     }
 }
 
-async fn add(api: &Api, path: &Path, no_wrap: bool, recursive: bool, provide: bool) -> Result<()> {
+async fn add(api: &Api, path: &Path, no_wrap: bool, recursive: bool, provide: bool) -> Result<(), Error> {
     if !path.exists() {
-        anyhow::bail!("Path does not exist");
+        return Err(Error::PathNotExist(path.to_path_buf()))
     }
     if !path.is_dir() && !path.is_file() {
-        anyhow::bail!("Path is not a file or directory");
+        return Err(Error::PathNotFileOrDir(path.to_path_buf()))
     }
     if path.is_dir() && !recursive {
-        anyhow::bail!(
-            "{} is a directory, use --recursive to add it",
-            path.display()
-        );
+        return Err(Error::PathIsDirNoRecursive(path.to_path_buf()))
     }
 
     let mut steps = 3;
@@ -190,16 +186,12 @@ async fn add(api: &Api, path: &Path, no_wrap: bool, recursive: bool, provide: bo
     let svc_status = require_services(api, BTreeSet::from(["store"])).await?;
     match (provide, svc_status.p2p.status()) {
         (true, ServiceStatus::Down(_status)) => {
-            anyhow::bail!("Add provides content to the IPFS network by default, but the p2p service is not running.\n{}",
-            "hint: try using the --offline flag, or run 'iroh start p2p'".yellow()
-            )
+            return Err(Error::AddButNoP2pService)
         }
         (true, ServiceStatus::Unknown)
         | (true, ServiceStatus::NotServing)
         | (true, ServiceStatus::ServiceUnknown) => {
-            anyhow::bail!("Add provides content to the IPFS network by default, but the p2p service is not running.\n{}",
-            "hint: try using the --offline flag, or run 'iroh start p2p'".yellow()
-            )
+            return Err(Error::AddButNoP2pService)
         }
         (true, ServiceStatus::Serving) => {}
         (false, _) => {
@@ -258,7 +250,7 @@ async fn add(api: &Api, path: &Path, no_wrap: bool, recursive: bool, provide: bo
     }
     pb.finish_and_clear();
 
-    let root = *cids.last().context("File processing failed")?;
+    let root = *cids.last().ok_or(Error::FileProcessingFailed)?;
 
     if provide {
         let pb = ProgressBar::new(cids.len().try_into().unwrap());
@@ -274,8 +266,7 @@ async fn add(api: &Api, path: &Path, no_wrap: bool, recursive: bool, provide: bo
         pb.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}) {msg}",
-            )
-            .unwrap(),
+            )?
         );
         pb.inc(0);
         for cid in cids {

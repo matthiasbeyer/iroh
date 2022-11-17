@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Result};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, style, style::Stylize, QueueableCommand};
 use futures::StreamExt;
@@ -10,13 +9,15 @@ use std::time::SystemTime;
 use sysinfo::PidExt;
 use tracing::info;
 
-use iroh_api::{Api, ApiError, ServiceStatus, StatusRow, StatusTable};
+use iroh_api::{Api, ServiceStatus, StatusRow, StatusTable};
 use iroh_util::lock::{LockError, ProgramLock};
+
+use crate::error::Error;
 
 const SERVICE_START_TIMEOUT_SECONDS: u64 = 15;
 
 /// Start any given services that aren't currently running.
-pub async fn start(api: &Api, services: &Vec<String>) -> Result<()> {
+pub async fn start(api: &Api, services: &Vec<String>) -> Result<(), Error> {
     let services = match services.is_empty() {
         true => BTreeSet::from(["gateway", "store", "p2p"]),
         false => {
@@ -31,8 +32,8 @@ pub async fn start(api: &Api, services: &Vec<String>) -> Result<()> {
 }
 
 // TODO(b5) - should check for configuration mismatch between iroh CLI configuration
-// TODO(b5) - services BTreeSet should be an enum
-async fn start_services(api: &Api, services: BTreeSet<&str>) -> Result<()> {
+// TODO(b5) - services HashSet should be an enum
+async fn start_services(api: &Api, services: BTreeSet<&str>) -> Result<(), Error> {
     // check for any running iroh services
     let table = api.check().await;
 
@@ -53,12 +54,11 @@ async fn start_services(api: &Api, services: BTreeSet<&str>) -> Result<()> {
         services.difference(expected_services).copied().collect();
 
     if !unknown_services.is_empty() {
-        let u = unknown_services.into_iter().collect::<Vec<&str>>();
-        let mut e = "Unknown services";
-        if u.len() == 1 {
-            e = "Unknown service";
-        }
-        return Err(anyhow!("{} {}.", e, u.join(", ")));
+        let u = unknown_services
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+        return Err(Error::UnknownServices(u));
     }
 
     let mut missing_services = BTreeSet::new();
@@ -100,12 +100,8 @@ async fn start_services(api: &Api, services: BTreeSet<&str>) -> Result<()> {
         let log_path = iroh_cache_path(format!("iroh-{}.log", service).as_str())?;
 
         // check if a binary by this name exists
-        let bin_path = which::which(&daemon_name).map_err(|_| {
-            anyhow!(format!(
-                "can't find {} daemon binary on your $PATH. please install {}.\n visit https://iroh.computer/docs/install for more info",
-                &daemon_name, &daemon_name
-            ))
-        })?;
+        let bin_path = which::which(&daemon_name)
+            .map_err(|_| Error::CannotFindDaemonBinary(daemon_name.to_string()))?;
 
         print!("starting {}... ", &daemon_name.bold());
 
@@ -132,7 +128,7 @@ async fn start_services(api: &Api, services: BTreeSet<&str>) -> Result<()> {
 
 /// stop the default set of services by sending SIGINT to any active daemons
 /// identified by lockfiles
-pub async fn stop(api: &Api, services: &Vec<String>) -> Result<()> {
+pub async fn stop(api: &Api, services: &Vec<String>) -> Result<(), Error> {
     let services = match services.is_empty() {
         true => BTreeSet::from(["store", "p2p", "gateway"]),
         false => {
@@ -146,7 +142,7 @@ pub async fn stop(api: &Api, services: &Vec<String>) -> Result<()> {
     stop_services(api, services).await
 }
 
-pub async fn stop_services(api: &Api, services: BTreeSet<&str>) -> Result<()> {
+pub async fn stop_services(api: &Api, services: BTreeSet<&str>) -> Result<(), Error> {
     for service in services {
         let daemon_name = format!("iroh-{}", service);
         info!("checking daemon {} lock", daemon_name);
@@ -198,7 +194,7 @@ pub async fn stop_services(api: &Api, services: BTreeSet<&str>) -> Result<()> {
     Ok(())
 }
 
-pub async fn status(api: &Api, watch: bool) -> Result<()> {
+pub async fn status(api: &Api, watch: bool) -> Result<(), Error> {
     let mut stdout = stdout();
     if watch {
         let status_stream = api.watch().await;
@@ -226,7 +222,7 @@ pub async fn status(api: &Api, watch: bool) -> Result<()> {
 
 /// queues the table for printing
 /// you must call `writer.flush()` to execute the queue
-pub fn queue_table<W>(table: &StatusTable, mut w: W) -> Result<()>
+pub fn queue_table<W>(table: &StatusTable, mut w: W) -> Result<(), Error>
 where
     W: Write,
 {
@@ -241,7 +237,7 @@ where
 
 // queue queues this row of the StatusRow to be written
 // You must call `writer.flush()` to actually write the content to the writer
-pub fn queue_row<W>(row: &StatusRow, w: &mut W) -> Result<()>
+pub fn queue_row<W>(row: &StatusRow, w: &mut W) -> Result<(), Error>
 where
     W: Write,
 {
@@ -280,13 +276,13 @@ where
 pub async fn require_services(
     api: &Api,
     services: BTreeSet<&str>,
-) -> Result<iroh_api::StatusTable> {
+) -> Result<iroh_api::StatusTable, Error> {
     let table = api.check().await;
     for service in table.iter() {
         if services.contains(service.name()) && service.status() != iroh_api::ServiceStatus::Serving
         {
-            return Err(anyhow!(ApiError::ConnectionRefused {
-                service: service.name()
+            return Err(Error::from(iroh_api::Error::ConnectionRefused {
+                service: service.name(),
             }));
         }
     }
@@ -299,7 +295,7 @@ async fn poll_until_status(
     api: &Api,
     service: &str,
     status: iroh_api::ServiceStatus,
-) -> Result<bool> {
+) -> Result<bool, Error> {
     let status_stream = api.watch().await;
     tokio::pin!(status_stream);
     let start = SystemTime::now();
@@ -319,7 +315,7 @@ async fn poll_until_status(
             }
         }
     }
-    Err(anyhow!(""))
+    Err(Error::Empty)
 }
 
 #[cfg(test)]

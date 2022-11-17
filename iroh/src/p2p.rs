@@ -1,9 +1,10 @@
 use crate::doc;
-use anyhow::{Error, Result};
 use clap::{Args, Subcommand};
 use crossterm::style::Stylize;
 use iroh_api::{Lookup, Multiaddr, P2pApi, PeerId, PeerIdOrAddr};
 use std::{collections::HashMap, fmt::Display, str::FromStr};
+
+use crate::error::Error;
 
 #[derive(Args, Debug, Clone)]
 #[clap(about = "Peer-2-peer commands")]
@@ -47,7 +48,7 @@ impl FromStr for PeerIdOrAddrArg {
         if let Ok(p) = PeerId::from_str(s) {
             return Ok(PeerIdOrAddrArg(PeerIdOrAddr::PeerId(p)));
         }
-        Err(anyhow::anyhow!("invalid peer id or multiaddress"))
+        Err(Error::InvalidPeerIdIOrMultiAddr)
     }
 }
 
@@ -61,13 +62,13 @@ impl Display for PeerIdOrAddrArg {
     }
 }
 
-pub async fn run_command(p2p: &P2pApi, cmd: &P2p) -> Result<()> {
+pub async fn run_command(p2p: &P2pApi, cmd: &P2p) -> Result<(), Error> {
     match &cmd.command {
         P2pCommands::Connect { addr } => match p2p.connect(&addr.0).await {
             Ok(_) => {
                 println!("Connected to {}!", addr);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(Error::from(e)),
         },
         P2pCommands::Lookup { addr } => {
             let lookup = match addr {

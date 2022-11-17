@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use crossterm::style::Stylize;
-use iroh_api::ApiError;
+use iroh_api::Error as ApiError;
 use std::io;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -24,35 +24,31 @@ async fn main() -> Result<()> {
     }
 }
 
-fn transform_error(r: Result<()>) -> Result<()> {
+fn transform_error(r: std::result::Result<(), iroh::error::Error>) -> Result<()> {
     match r {
         Ok(_) => Ok(()),
-        Err(e) => {
-            let io_error = e.root_cause().downcast_ref::<io::Error>();
-            if let Some(io_error) = io_error {
+        Err(e) => match e {
+            iroh::error::Error::Io(io_error) => {
                 if io_error.kind() == io::ErrorKind::ConnectionRefused {
-                    return Err(anyhow!(
+                    Err(anyhow!(
                         "Connection refused. Are services running?\n{}",
                         "hint: see 'iroh start' for more on starting services".yellow(),
-                    ));
+                    ))
+                } else {
+                    Err(anyhow::Error::from(io_error))
                 }
             }
-            let api_error = e.root_cause().downcast_ref::<ApiError>();
-            if let Some(api_error) = api_error {
-                match api_error {
-                    ApiError::ConnectionRefused { service } => {
-                        return Err(anyhow!(
-                            "Connection refused. This command requires a running {} service.\n{}",
-                            service,
-                            format!("hint: try 'iroh start {}'", service).yellow(),
-                        ));
-                    }
-                    _ => {
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e)
-        }
+
+            iroh::error::Error::Api(api_error) => match api_error {
+                ApiError::ConnectionRefused { service } => Err(anyhow!(
+                    "Connection refused. This command requires a running {} service.\n{}",
+                    service,
+                    format!("hint: try 'iroh start {}'", service).yellow(),
+                )),
+                _ => Err(anyhow::Error::from(api_error)),
+            },
+
+            other => Err(anyhow::Error::from(other)),
+        },
     }
 }
