@@ -1,7 +1,6 @@
 use std::{sync::Arc, thread::available_parallelism};
 
 use ahash::AHashSet;
-use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use cid::Cid;
 use iroh_metrics::{
@@ -21,6 +20,7 @@ use tokio::task;
 
 use crate::cf::{GraphV0, MetadataV0, CF_BLOBS_V0, CF_GRAPH_V0, CF_ID_V0, CF_METADATA_V0};
 use crate::Config;
+use crate::error::Error;
 
 #[derive(Clone)]
 pub struct Store {
@@ -92,12 +92,12 @@ struct CodeAndId {
 impl Store {
     /// Creates a new database.
     #[tracing::instrument]
-    pub async fn create(config: Config) -> Result<Self> {
+    pub async fn create(config: Config) -> Result<Self, Error> {
         let (mut options, cache) = default_options();
         options.create_if_missing(true);
 
         let path = config.path.clone();
-        let db = task::spawn_blocking(move || -> Result<_> {
+        let db = task::spawn_blocking(move || -> Result<_, Error> {
             let mut db = RocksDb::open(&options, path)?;
             {
                 let opts = default_blob_opts();
@@ -120,9 +120,7 @@ impl Store {
         })
         .await??;
 
-        let _rpc_client = RpcClient::new(config.rpc_client)
-            .await
-            .context("Error creating rpc client for store")?;
+        let _rpc_client = RpcClient::new(config.rpc_client).await?;
 
         Ok(Store {
             inner: Arc::new(InnerStore {
@@ -136,13 +134,13 @@ impl Store {
 
     /// Opens an existing database.
     #[tracing::instrument]
-    pub async fn open(config: Config) -> Result<Self> {
+    pub async fn open(config: Config) -> Result<Self, Error> {
         let (mut options, cache) = default_options();
         options.create_if_missing(false);
         // TODO: find a way to read existing options
 
         let path = config.path.clone();
-        let (db, next_id) = task::spawn_blocking(move || -> Result<_> {
+        let (db, next_id) = task::spawn_blocking(move || -> Result<_, Error> {
             let db = RocksDb::open_cf(
                 &options,
                 path,
@@ -153,7 +151,7 @@ impl Store {
             let next_id = {
                 let cf_meta = db
                     .cf_handle(CF_METADATA_V0)
-                    .ok_or_else(|| anyhow!("missing column family: metadata"))?;
+                    .ok_or_else(|| Error::MissingColFam("metadata"))?;
 
                 let mut iter = db.full_iterator_cf(&cf_meta, IteratorMode::End);
                 let last_id = iter
@@ -170,11 +168,7 @@ impl Store {
         })
         .await??;
 
-        let _rpc_client = RpcClient::new(config.rpc_client)
-            .await
-            // TODO: first conflict between `anyhow` & `anyhow`
-            // .map_err(|e| e.context("Error creating rpc client for store"))?;
-            .map_err(|e| anyhow!("Error creating rpc client for store: {:?}", e))?;
+        let _rpc_client = RpcClient::new(config.rpc_client).await?;
 
         Ok(Store {
             inner: Arc::new(InnerStore {
@@ -187,7 +181,7 @@ impl Store {
     }
 
     #[tracing::instrument(skip(self, links, blob))]
-    pub fn put<T: AsRef<[u8]>, L>(&self, cid: Cid, blob: T, links: L) -> Result<()>
+    pub fn put<T: AsRef<[u8]>, L>(&self, cid: Cid, blob: T, links: L) -> Result<(), Error>
     where
         L: IntoIterator<Item = Cid>,
     {
@@ -195,42 +189,42 @@ impl Store {
     }
 
     #[tracing::instrument(skip(self, blocks))]
-    pub fn put_many(&self, blocks: impl IntoIterator<Item = (Cid, Bytes, Vec<Cid>)>) -> Result<()> {
+    pub fn put_many(&self, blocks: impl IntoIterator<Item = (Cid, Bytes, Vec<Cid>)>) -> Result<(), Error> {
         self.write_store()?.put_many(blocks)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn get_blob_by_hash(&self, hash: &Multihash) -> Result<Option<DBPinnableSlice<'_>>> {
+    pub fn get_blob_by_hash(&self, hash: &Multihash) -> Result<Option<DBPinnableSlice<'_>>, Error> {
         self.read_store()?.get_blob_by_hash(hash)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn has_blob_for_hash(&self, hash: &Multihash) -> Result<bool> {
+    pub fn has_blob_for_hash(&self, hash: &Multihash) -> Result<bool, Error> {
         self.read_store()?.has_blob_for_hash(hash)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn get(&self, cid: &Cid) -> Result<Option<DBPinnableSlice<'_>>> {
+    pub fn get(&self, cid: &Cid) -> Result<Option<DBPinnableSlice<'_>>, Error> {
         self.read_store()?.get(cid)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn get_size(&self, cid: &Cid) -> Result<Option<usize>> {
+    pub fn get_size(&self, cid: &Cid) -> Result<Option<usize>, Error> {
         self.read_store()?.get_size(cid)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn has(&self, cid: &Cid) -> Result<bool> {
+    pub fn has(&self, cid: &Cid) -> Result<bool, Error> {
         self.read_store()?.has(cid)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn get_links(&self, cid: &Cid) -> Result<Option<Vec<Cid>>> {
+    pub fn get_links(&self, cid: &Cid) -> Result<Option<Vec<Cid>>, Error> {
         self.read_store()?.get_links(cid)
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn consistency_check(&self) -> Result<Vec<String>> {
+    pub fn consistency_check(&self) -> Result<Vec<String>, Error> {
         self.read_store()?.consistency_check()
     }
 
@@ -238,11 +232,11 @@ impl Store {
     fn get_ids_for_hash(
         &self,
         hash: &Multihash,
-    ) -> Result<impl Iterator<Item = Result<CodeAndId>> + '_> {
+    ) -> Result<impl Iterator<Item = Result<CodeAndId, Error>> + '_, Error> {
         self.read_store()?.get_ids_for_hash(hash)
     }
 
-    fn write_store(&self) -> Result<WriteStore> {
+    fn write_store(&self) -> Result<WriteStore, Error> {
         let db = &self.inner.content;
         Ok(WriteStore {
             db,
@@ -251,7 +245,7 @@ impl Store {
         })
     }
 
-    fn read_store(&self) -> Result<ReadStore> {
+    fn read_store(&self) -> Result<ReadStore, Error> {
         let db = &self.inner.content;
         Ok(ReadStore {
             db,
@@ -262,8 +256,8 @@ impl Store {
 
     pub(crate) async fn spawn_blocking<T: Send + Sync + 'static>(
         &self,
-        f: impl FnOnce(Self) -> anyhow::Result<T> + Send + Sync + 'static,
-    ) -> anyhow::Result<T> {
+        f: impl FnOnce(Self) -> Result<T, Error> + Send + Sync + 'static,
+    ) -> Result<T, Error> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || f(this)).await?
     }
@@ -299,26 +293,26 @@ struct ColumnFamilies<'a> {
 }
 
 impl<'a> ColumnFamilies<'a> {
-    fn new(db: &'a RocksDb) -> anyhow::Result<Self> {
+    fn new(db: &'a RocksDb) -> Result<Self, Error> {
         Ok(Self {
             id: db
                 .cf_handle(CF_ID_V0)
-                .context("missing column family: id")?,
+                .ok_or_else(|| Error::MissingColFam("id"))?,
             metadata: db
                 .cf_handle(CF_METADATA_V0)
-                .context("missing column family: metadata")?,
+                .ok_or_else(|| Error::MissingColFam("metadata"))?,
             graph: db
                 .cf_handle(CF_GRAPH_V0)
-                .context("missing column family: graph")?,
+                .ok_or_else(|| Error::MissingColFam("graph"))?,
             blobs: db
                 .cf_handle(CF_BLOBS_V0)
-                .context("missing column family: blobs")?,
+                .ok_or_else(|| Error::MissingColFam("blobs"))?,
         })
     }
 }
 
 impl<'a> WriteStore<'a> {
-    fn put<T: AsRef<[u8]>, L>(&mut self, cid: Cid, blob: T, links: L) -> Result<()>
+    fn put<T: AsRef<[u8]>, L>(&mut self, cid: Cid, blob: T, links: L) -> Result<(), Error>
     where
         L: IntoIterator<Item = Cid>,
     {
@@ -361,7 +355,7 @@ impl<'a> WriteStore<'a> {
         Ok(())
     }
 
-    fn put_many(&mut self, blocks: impl IntoIterator<Item = (Cid, Bytes, Vec<Cid>)>) -> Result<()> {
+    fn put_many(&mut self, blocks: impl IntoIterator<Item = (Cid, Bytes, Vec<Cid>)>) -> Result<(), Error> {
         inc!(StoreMetrics::PutRequests);
         let start = std::time::Instant::now();
         let mut total_blob_size = 0;
@@ -411,7 +405,7 @@ impl<'a> WriteStore<'a> {
 
     /// Takes a list of cids and gives them ids, which are both stored and then returned.
     #[tracing::instrument(skip(self, cids))]
-    fn ensure_id_many<I>(&mut self, cids: I) -> Result<Vec<u64>>
+    fn ensure_id_many<I>(&mut self, cids: I) -> Result<Vec<u64>, Error>
     where
         I: IntoIterator<Item = Cid>,
     {
@@ -453,19 +447,19 @@ impl<'a> WriteStore<'a> {
     }
 
     #[tracing::instrument(skip(self))]
-    fn get_id(&self, cid: &Cid) -> Result<Option<u64>> {
+    fn get_id(&self, cid: &Cid) -> Result<Option<u64>, Error> {
         let id_key = id_key(cid);
         let maybe_id_bytes = self.db.get_pinned_cf(self.cf.id, id_key)?;
         match maybe_id_bytes {
             Some(bytes) => {
-                let arr = bytes[..8].try_into().map_err(|e| anyhow!("{:?}", e))?;
+                let arr = bytes[..8].try_into()?;
                 Ok(Some(u64::from_be_bytes(arr)))
             }
             None => Ok(None),
         }
     }
 
-    fn has(&self, cid: &Cid) -> Result<bool> {
+    fn has(&self, cid: &Cid) -> Result<bool, Error> {
         match self.get_id(cid)? {
             Some(id) => {
                 let exists = self
@@ -480,7 +474,7 @@ impl<'a> WriteStore<'a> {
 }
 
 impl<'a> ReadStore<'a> {
-    fn get(&self, cid: &Cid) -> Result<Option<DBPinnableSlice<'a>>> {
+    fn get(&self, cid: &Cid) -> Result<Option<DBPinnableSlice<'a>>, Error> {
         inc!(StoreMetrics::GetRequests);
         let start = std::time::Instant::now();
         let res = match self.get_id(cid)? {
@@ -502,7 +496,7 @@ impl<'a> ReadStore<'a> {
         res
     }
 
-    fn get_size(&self, cid: &Cid) -> Result<Option<usize>> {
+    fn get_size(&self, cid: &Cid) -> Result<Option<usize>, Error> {
         match self.get_id(cid)? {
             Some(id) => {
                 inc!(StoreMetrics::StoreHit);
@@ -516,7 +510,7 @@ impl<'a> ReadStore<'a> {
         }
     }
 
-    fn has(&self, cid: &Cid) -> Result<bool> {
+    fn has(&self, cid: &Cid) -> Result<bool, Error> {
         match self.get_id(cid)? {
             Some(id) => {
                 let exists = self
@@ -529,7 +523,7 @@ impl<'a> ReadStore<'a> {
         }
     }
 
-    fn get_links(&self, cid: &Cid) -> Result<Option<Vec<Cid>>> {
+    fn get_links(&self, cid: &Cid) -> Result<Option<Vec<Cid>>, Error> {
         inc!(StoreMetrics::GetLinksRequests);
         let start = std::time::Instant::now();
         let res = match self.get_id(cid)? {
@@ -551,12 +545,12 @@ impl<'a> ReadStore<'a> {
     }
 
     #[tracing::instrument(skip(self))]
-    fn get_id(&self, cid: &Cid) -> Result<Option<u64>> {
+    fn get_id(&self, cid: &Cid) -> Result<Option<u64>, Error> {
         let id_key = id_key(cid);
         let maybe_id_bytes = self.db.get_pinned_cf(self.cf.id, id_key)?;
         match maybe_id_bytes {
             Some(bytes) => {
-                let arr = bytes[..8].try_into().map_err(|e| anyhow!("{:?}", e))?;
+                let arr = bytes[..8].try_into()?;
                 Ok(Some(u64::from_be_bytes(arr)))
             }
             None => Ok(None),
@@ -566,7 +560,7 @@ impl<'a> ReadStore<'a> {
     fn get_ids_for_hash(
         &self,
         hash: &Multihash,
-    ) -> Result<impl Iterator<Item = Result<CodeAndId>> + 'a> {
+    ) -> Result<impl Iterator<Item = Result<CodeAndId, Error>> + 'a, Error> {
         let hash = hash.to_bytes();
         let iter = self
             .db
@@ -589,7 +583,7 @@ impl<'a> ReadStore<'a> {
             }))
     }
 
-    fn get_blob_by_hash(&self, hash: &Multihash) -> Result<Option<DBPinnableSlice<'a>>> {
+    fn get_blob_by_hash(&self, hash: &Multihash) -> Result<Option<DBPinnableSlice<'a>>, Error> {
         for elem in self.get_ids_for_hash(hash)? {
             let id = elem?.id;
             let id_bytes = id.to_be_bytes();
@@ -601,7 +595,7 @@ impl<'a> ReadStore<'a> {
     }
 
     #[tracing::instrument(skip(self))]
-    fn has_blob_for_hash(&self, hash: &Multihash) -> Result<bool> {
+    fn has_blob_for_hash(&self, hash: &Multihash) -> Result<bool, Error> {
         for elem in self.get_ids_for_hash(hash)? {
             let id = elem?.id;
             let id_bytes = id.to_be_bytes();
@@ -613,28 +607,28 @@ impl<'a> ReadStore<'a> {
     }
 
     #[tracing::instrument(skip(self))]
-    fn get_by_id(&self, id: u64) -> Result<Option<DBPinnableSlice<'a>>> {
+    fn get_by_id(&self, id: u64) -> Result<Option<DBPinnableSlice<'a>>, Error> {
         let maybe_blob = self.db.get_pinned_cf(self.cf.blobs, id.to_be_bytes())?;
 
         Ok(maybe_blob)
     }
 
     #[tracing::instrument(skip(self))]
-    fn get_size_by_id(&self, id: u64) -> Result<Option<usize>> {
+    fn get_size_by_id(&self, id: u64) -> Result<Option<usize>, Error> {
         let maybe_blob = self.db.get_pinned_cf(self.cf.blobs, id.to_be_bytes())?;
         let maybe_size = maybe_blob.map(|b| b.len());
         Ok(maybe_size)
     }
 
     #[tracing::instrument(skip(self))]
-    fn get_links_by_id(&self, id: u64) -> Result<Option<Vec<Cid>>> {
+    fn get_links_by_id(&self, id: u64) -> Result<Option<Vec<Cid>>, Error> {
         let id_bytes = id.to_be_bytes();
         // FIXME: can't use pinned because otherwise this can trigger alignment issues :/
         let cf = &self.cf;
         match self.db.get_cf(cf.graph, id_bytes)? {
             Some(links_id) => {
                 let graph = rkyv::check_archived_root::<GraphV0>(&links_id)
-                    .map_err(|e| anyhow!("{:?}", e))?;
+                    .map_err(|e| Error::RkyvCheckArchivedRoot(e.to_string()))?;
                 let keys = graph
                     .children
                     .iter()
@@ -645,13 +639,13 @@ impl<'a> ReadStore<'a> {
                     match meta? {
                         Some(meta) => {
                             let meta = rkyv::check_archived_root::<MetadataV0>(&meta)
-                                .map_err(|e| anyhow!("{:?}", e))?;
+                                .map_err(|e| Error::RkyvCheckArchivedRoot(e.to_string()))?;
                             let multihash = cid::multihash::Multihash::from_bytes(&meta.multihash)?;
                             let c = cid::Cid::new_v1(meta.codec, multihash);
                             links.push(c);
                         }
                         None => {
-                            bail!("invalid link: {}", graph.children[i]);
+                            return Err(Error::InvalidLink(graph.children[i]))
                         }
                     }
                 }
@@ -662,7 +656,7 @@ impl<'a> ReadStore<'a> {
     }
 
     /// Perform an internal consistency check on the store, and return all internal errors found.
-    fn consistency_check(&self) -> anyhow::Result<Vec<String>> {
+    fn consistency_check(&self) -> Result<Vec<String>, Error> {
         let mut res = Vec::new();
         let cf = &self.cf;
         let n_meta = self

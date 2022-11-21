@@ -1,4 +1,3 @@
-use anyhow::{anyhow, bail, Result};
 use config::{ConfigError, Map, Source, Value};
 use iroh_metrics::config::Config as MetricsConfig;
 use iroh_rpc_client::Config as RpcClientConfig;
@@ -10,6 +9,8 @@ use iroh_util::{insert_into_config_map, iroh_data_path};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::error::Error;
+
 /// CONFIG_FILE_NAME is the name of the optional config file located in the iroh home directory
 pub const CONFIG_FILE_NAME: &str = "store.config.toml";
 /// ENV_PREFIX should be used along side the config field name to set a config field using
@@ -19,10 +20,10 @@ pub const ENV_PREFIX: &str = "IROH_STORE";
 
 /// the path to data directory. If arg_path is `None`, the default iroh_data_path()/store is used
 /// iroh_data_path() returns an operating system-specific directory
-pub fn config_data_path(arg_path: Option<PathBuf>) -> Result<PathBuf> {
+pub fn config_data_path(arg_path: Option<PathBuf>) -> Result<PathBuf, Error> {
     match arg_path {
         Some(p) => Ok(p),
-        None => iroh_data_path("store").map_err(|e| anyhow!("{}", e)),
+        None => iroh_data_path("store").map_err(Error::from),
     }
 }
 
@@ -53,7 +54,7 @@ impl Config {
     }
 
     /// Derive server addr for non memory addrs.
-    pub fn server_rpc_addr(&self) -> Result<Option<StoreServerAddr>> {
+    pub fn server_rpc_addr(&self) -> Result<Option<StoreServerAddr>, Error> {
         self.rpc_client
             .store_addr
             .as_ref()
@@ -65,8 +66,8 @@ impl Config {
                     #[cfg(all(feature = "rpc-grpc", unix))]
                     Addr::GrpcUds(path) => Ok(Addr::GrpcUds(path.clone())),
                     #[cfg(feature = "rpc-mem")]
-                    Addr::Mem(_) => bail!("can not derive rpc_addr for mem addr"),
-                    _ => bail!("invalid rpc_addr"),
+                    Addr::Mem(_) => Err(Error::CannotDeriveRpcAddrForMem),
+                    _ => Err(Error::InvalidRpcAddr),
                 }
             })
             .transpose()
